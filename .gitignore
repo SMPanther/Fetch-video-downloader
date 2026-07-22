@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output (electron-builder) — the installer belongs in GitHub Releases,
+# not committed to the repo
+dist/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
+
+# Logs
+npm-debug.log*

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' https: data:;" />
+  <title>Fetch — Video Download Manager</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">▣</span>
+        <span class="brand-name">Fetch</span>
+      </div>
+      <div class="topbar-stats">
+        <div class="stat">
+          <span class="stat-value" id="stat-active">0</span>
+          <span class="stat-label">active</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-queued">0</span>
+          <span class="stat-label">queued</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-done">0</span>
+          <span class="stat-label">done</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="intake">
+      <div id="ffmpeg-banner" class="ffmpeg-banner" style="display:none;">
+        <span id="ffmpeg-banner-text">Setting up ffmpeg…</span>
+      </div>
+      <div class="intake-row">
+        <input
+          id="url-input"
+          type="text"
+          placeholder="Paste a video or playlist URL…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <select id="format-select">
+          <option value="best">Best quality</option>
+          <option value="1080p">Up to 1080p</option>
+          <option value="720p">Up to 720p</option>
+          <option value="480p">Up to 480p</option>
+          <option value="audio">Audio only (MP3)</option>
+        </select>
+        <button id="add-btn" class="btn-primary">Add to queue</button>
+      </div>
+      <div class="intake-row secondary">
+        <span class="folder-label">Save to</span>
+        <button id="folder-btn" class="folder-path" title="Change download folder">
+          <span id="folder-path-text">Loading…</span>
+        </button>
+
+        <label class="checkbox-label" title="Download subtitles/captions alongside the video, if available">
+          <input type="checkbox" id="subtitles-checkbox" />
+          <span>Subtitles</span>
+        </label>
+
+        <label class="cookies-label" title="Use your browser's login cookies — needed for private/unlisted videos you have access to">
+          <span>Cookies</span>
+          <select id="cookies-select">
+            <option value="none">None</option>
+            <option value="chrome">Chrome</option>
+            <option value="edge">Edge</option>
+            <option value="firefox">Firefox</option>
+            <option value="brave">Brave</option>
+          </select>
+        </label>
+
+        <span id="intake-message" class="intake-message"></span>
+      </div>
+    </section>
+
+    <section class="queue-section">
+      <div class="queue-header">
+        <button class="tab-btn is-active" id="tab-manifest" data-tab="manifest">Manifest</button>
+        <button class="tab-btn" id="tab-history" data-tab="history">History</button>
+        <span class="queue-header-divider"></span>
+        <button class="clear-history-btn" id="clear-history-btn" style="display:none;">Clear history</button>
+      </div>
+      <div id="queue-list" class="queue-list">
+        <div class="empty-state" id="empty-state">
+          <div class="empty-glyph">▢</div>
+          <div class="empty-title">Nothing queued yet</div>
+          <div class="empty-sub">Paste a URL above — single videos and whole playlists both work.</div>
+        </div>
+      </div>
+      <div id="history-list" class="queue-list" style="display:none;">
+        <div class="empty-state" id="history-empty-state">
+          <div class="empty-glyph">▢</div>
+          <div class="empty-title">No downloads yet</div>
+          <div class="empty-sub">Finished downloads show up here, even after you restart the app.</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
