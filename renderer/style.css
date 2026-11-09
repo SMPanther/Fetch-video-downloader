@@ -282,6 +282,7 @@ button {
 .ffmpeg-banner {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
   background: var(--accent-soft);
   border: 1px solid rgba(230, 163, 68, 0.3);
@@ -310,19 +311,11 @@ button {
 .queue-header {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 18px;
   padding: 18px 4px 10px;
   position: sticky;
   top: 0;
   background: var(--bg);
-}
-
-.queue-header span:first-child {
-  font-family: var(--font-display);
-  font-size: 11px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--text-faint);
 }
 
 .queue-header-divider {
@@ -477,6 +470,16 @@ button {
   background: var(--accent-soft);
 }
 
+.tag.status-processing {
+  color: var(--accent);
+  border-color: var(--accent-soft);
+  background: var(--accent-soft);
+}
+
+.tag.status-paused {
+  color: var(--text-muted);
+}
+
 .tag.status-done {
   color: var(--success);
   border-color: rgba(95, 217, 138, 0.25);
@@ -491,12 +494,6 @@ button {
 
 .tag.status-cancelled {
   color: var(--text-faint);
-}
-
-.tag.status-paused {
-  color: var(--text-muted);
-  border-color: var(--border);
-  background: var(--panel-alt);
 }
 
 .ticket-progress-track {
@@ -515,7 +512,6 @@ button {
   transition: width 0.25s ease;
 }
 
-.tag.status-done ~ .ticket-progress-track .ticket-progress-fill,
 .ticket.is-done .ticket-progress-fill {
   background: var(--success);
 }
@@ -542,6 +538,7 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
 }
 
 .ticket-readout {
@@ -570,26 +567,27 @@ button {
   text-transform: uppercase;
   cursor: pointer;
   padding: 4px 10px;
-  flex-shrink: 0;
   transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
 }
 
-.ticket-action-pause {
+.ticket-action-pause,
+.ticket-action-stop {
+  color: var(--error);
+  border-color: rgba(239, 100, 97, 0.3);
+}
+
+.ticket-action-pause:hover,
+.ticket-action-stop:hover {
+  background: rgba(239, 100, 97, 0.12);
+}
+
+.ticket-action-resume {
   color: var(--accent);
   border-color: var(--accent-soft);
 }
 
-.ticket-action-pause:hover {
-  background: var(--accent-soft);
-}
-
-.ticket-action-resume {
-  color: var(--success);
-  border-color: rgba(95, 217, 138, 0.3);
-}
-
 .ticket-action-resume:hover {
-  background: rgba(95, 217, 138, 0.12);
+  background: var(--accent-soft);
 }
 
 .ticket-action-discard,

@@ -2,7 +2,7 @@ const MAX_CONCURRENT = 3;
 
 const state = {
   folder: null,
-  queue: [], // { id, title, url, format, status, percent, speed, eta, total }
+  queue: [], // { id, title, url, thumbnail, format, subtitles, status, percent, speed, eta, total, filepath }
   nextId: 1,
 };
 
@@ -20,6 +20,11 @@ const els = {
   statDone: document.getElementById('stat-done'),
   ffmpegBanner: document.getElementById('ffmpeg-banner'),
   ffmpegBannerText: document.getElementById('ffmpeg-banner-text'),
+  ytdlpBanner: document.getElementById('ytdlp-banner'),
+  ytdlpBannerText: document.getElementById('ytdlp-banner-text'),
+  updateBanner: document.getElementById('update-banner'),
+  updateBannerText: document.getElementById('update-banner-text'),
+  updateRestartBtn: document.getElementById('update-restart-btn'),
   subtitlesCheckbox: document.getElementById('subtitles-checkbox'),
   cookiesSelect: document.getElementById('cookies-select'),
   tabManifest: document.getElementById('tab-manifest'),
@@ -29,15 +34,22 @@ const els = {
   clearHistoryBtn: document.getElementById('clear-history-btn'),
 };
 
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function thumbHtml(thumbnail) {
   return thumbnail
     ? `<div class="ticket-thumb"><img src="${escapeHtml(thumbnail)}" loading="lazy" referrerpolicy="no-referrer" /></div>`
     : `<div class="ticket-thumb"><span class="ticket-thumb-placeholder">▢</span></div>`;
 }
 
-// Swap a broken thumbnail image for the placeholder glyph. Done via an actual
-// event listener (not an inline onerror= attribute) since inline handlers are
-// blocked by this app's CSP (script-src doesn't include 'unsafe-inline').
+// Swap a broken thumbnail image for the placeholder glyph via a real event
+// listener (not an inline onerror= attribute, which this app's CSP blocks).
 function wireThumbFallback(container) {
   container.querySelectorAll('.ticket-thumb img').forEach((img) => {
     img.addEventListener('error', () => {
@@ -51,6 +63,8 @@ function shortFolder(p) {
   const parts = p.split(/[\\/]/).filter(Boolean);
   return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : p;
 }
+
+// ---- ffmpeg / yt-dlp / app-update banners ----------------------------------
 
 function setFfmpegBanner(status) {
   const { ffmpegBanner, ffmpegBannerText } = els;
@@ -79,7 +93,48 @@ function setFfmpegBanner(status) {
   }
 }
 
+function setYtdlpBanner(status) {
+  const { ytdlpBanner, ytdlpBannerText } = els;
+
+  if (status.state === 'checking') {
+    ytdlpBanner.style.display = 'flex';
+    ytdlpBannerText.textContent = 'Checking for a yt-dlp update…';
+  } else if (status.state === 'updated') {
+    ytdlpBanner.style.display = 'flex';
+    ytdlpBannerText.textContent = status.version ? `yt-dlp updated to ${status.version}.` : 'yt-dlp updated.';
+    setTimeout(() => (ytdlpBanner.style.display = 'none'), 4000);
+  } else if (status.state === 'up-to-date' || status.state === 'checked') {
+    ytdlpBanner.style.display = 'none';
+  } else if (status.state === 'error') {
+    ytdlpBanner.style.display = 'none'; // non-fatal — just keep using the bundled copy silently
+  }
+}
+
 window.api.onFfmpegStatus(setFfmpegBanner);
+window.api.onYtdlpStatus(setYtdlpBanner);
+
+window.api.onUpdateStatus((status) => {
+  const { updateBanner, updateBannerText, updateRestartBtn } = els;
+  if (status.state === 'checking' || status.state === 'up-to-date') {
+    updateBanner.style.display = 'none';
+    return;
+  }
+  updateBanner.style.display = 'flex';
+  if (status.state === 'downloading') {
+    updateBannerText.textContent = `Downloading update${status.version ? ' v' + status.version : ''}… ${status.percent ?? 0}%`;
+    updateRestartBtn.style.display = 'none';
+  } else if (status.state === 'ready') {
+    updateBannerText.textContent = `Update v${status.version} ready to install.`;
+    updateRestartBtn.style.display = 'inline-block';
+  } else if (status.state === 'error') {
+    updateBannerText.textContent = 'Update check failed — you can keep using the app as normal.';
+    updateRestartBtn.style.display = 'none';
+  }
+});
+
+els.updateRestartBtn.addEventListener('click', () => window.api.installUpdate());
+
+// ---- Startup ----------------------------------------------------------------
 
 async function init() {
   state.folder = await window.api.defaultDownloadFolder();
@@ -146,6 +201,7 @@ async function handleAdd() {
         speed: '',
         eta: '',
         total: '',
+        filepath: null,
       });
     });
 
@@ -167,76 +223,54 @@ function activeCount() {
 function processQueue() {
   const slotsFree = MAX_CONCURRENT - activeCount();
   if (slotsFree <= 0) return;
-
   const nextItems = state.queue.filter((i) => i.status === 'queued').slice(0, slotsFree);
   nextItems.forEach((item) => startItem(item));
 }
 
 async function startItem(item) {
   item.status = 'downloading';
-  item.message = '';
+  item.percent = typeof item.percent === 'number' && item.percent > 0 ? item.percent : null;
   renderQueue();
 
-  try {
-    const ok = await window.api.startDownload({
-      id: item.id,
-      url: item.url,
-      folder: state.folder,
-      format: item.format,
-      title: item.title,
-      thumbnail: item.thumbnail,
-      subtitles: item.subtitles,
-    });
-    if (ok === false) {
-      // Main process caught a setup error and already sent a progress event
-      // with the real message; nothing else to do here.
-      return;
-    }
-  } catch (err) {
-    item.status = 'error';
-    item.message = err.message || 'Failed to start the download.';
-    renderQueue();
-    processQueue();
-  }
-}
-
-window.api.onProgress((data) => {
-  const item = state.queue.find((i) => i.id === data.id);
-  if (!item) return;
-
-  if ('percent' in data) item.percent = data.percent; // may be null — handled at render time
-  if (data.total) item.total = data.total;
-  if (data.speed) item.speed = data.speed;
-  if (data.eta) item.eta = data.eta;
-  if (data.message) item.message = data.message;
-  if (data.filepath) item.filepath = data.filepath;
-  if (data.status) item.status = data.status;
-
-  renderQueue();
-
-  if (['done', 'error', 'cancelled', 'paused'].includes(data.status)) {
-    processQueue();
-  }
-});
-
-function removeFromQueue(id) {
-  state.queue = state.queue.filter((i) => i.id !== id);
-  renderQueue();
-}
-
-function pauseItem(id) {
-  window.api.pauseDownload(id);
-  // Actual status flips to 'paused' once the process reports back over onProgress.
+  await window.api.startDownload({
+    id: item.id,
+    url: item.url,
+    folder: state.folder,
+    format: item.format,
+    title: item.title,
+    thumbnail: item.thumbnail,
+    subtitles: item.subtitles,
+  });
 }
 
 function resumeItem(id) {
   const item = state.queue.find((i) => i.id === id);
-  if (item) startItem(item);
+  if (!item) return;
+  if (activeCount() >= MAX_CONCURRENT) {
+    item.status = 'queued';
+    renderQueue();
+    return;
+  }
+  // 'error' items retry the same way a paused one resumes — same startDownload
+  // call, same temp dir, yt-dlp just starts fresh if there was nothing to resume.
+  startItem(item);
+}
+
+function pauseItem(id) {
+  const item = state.queue.find((i) => i.id === id);
+  if (!item) return;
+  window.api.pauseDownload(id);
 }
 
 function discardItem(id) {
-  window.api.cancelDownload(id);
+  const item = state.queue.find((i) => i.id === id);
+  window.api.cancelDownload(id, item ? [] : undefined);
   removeFromQueue(id);
+}
+
+function removeFromQueue(id) {
+  state.queue = state.queue.filter((i) => i.id !== id);
+  renderQueue();
 }
 
 async function deleteItem(id) {
@@ -244,14 +278,13 @@ async function deleteItem(id) {
   if (item && item.filepath) {
     try {
       await window.api.deleteFile(item.filepath);
-    } catch (err) {
-      // File may already be gone or locked; still remove it from the list.
+    } catch (_e) {
+      // File may already be gone; still remove it from the list.
     }
   }
   removeFromQueue(id);
 }
 
-// Decides which action button(s) show, based on the item's current status
 function actionsFor(item) {
   switch (item.status) {
     case 'queued':
@@ -297,6 +330,25 @@ function statusLabel(status) {
   }
 }
 
+window.api.onProgress((data) => {
+  const item = state.queue.find((i) => i.id === data.id);
+  if (!item) return;
+
+  if ('percent' in data) item.percent = data.percent;
+  if (data.total) item.total = data.total;
+  if (data.speed) item.speed = data.speed;
+  if (data.eta) item.eta = data.eta;
+  if (data.message) item.message = data.message;
+  if (data.filepath) item.filepath = data.filepath;
+  if (data.status) item.status = data.status;
+
+  renderQueue();
+
+  if (['done', 'error', 'cancelled', 'paused'].includes(data.status)) {
+    processQueue();
+  }
+});
+
 function renderQueue() {
   els.emptyState.style.display = state.queue.length ? 'none' : 'flex';
 
@@ -306,7 +358,6 @@ function renderQueue() {
   els.statQueued.textContent = state.queue.filter((i) => i.status === 'queued').length;
   els.statDone.textContent = state.queue.filter((i) => i.status === 'done').length;
 
-  // Remove old tickets (keep empty state node)
   [...els.queueList.querySelectorAll('.ticket')].forEach((el) => el.remove());
 
   state.queue
@@ -327,24 +378,24 @@ function renderQueue() {
         readoutParts.push(item.message || 'Something went wrong');
       } else if (item.status === 'processing') {
         readoutParts.push('Merging / converting…');
+      } else if (item.status === 'paused') {
+        readoutParts.push('Paused — partial file kept on disk');
       } else if (item.status === 'done') {
         readoutParts.push('Saved to ' + shortFolder(state.folder));
-      } else if (item.status === 'paused') {
-        readoutParts.push('Paused — resume to continue from where it left off');
       } else if (item.status === 'cancelled') {
         readoutParts.push('Cancelled');
       } else {
         readoutParts.push('Waiting in queue…');
       }
 
-      const actions = actionsFor(item);
-      const actionsHtml = actions
-        .map((a) => `<button class="ticket-action ticket-action-${a.kind}" data-kind="${a.kind}">${a.label}</button>`)
-        .join('');
-
       const hasPercent = typeof item.percent === 'number';
       const isIndeterminate = item.status === 'downloading' && !hasPercent;
       const barWidth = item.status === 'done' ? 100 : hasPercent ? item.percent : 0;
+
+      const actions = actionsFor(item);
+      const actionsHtml = actions
+        .map((a) => `<button class="ticket-action ticket-action-${a.kind}">${a.label}</button>`)
+        .join('');
 
       ticket.innerHTML = `
         <div class="ticket-stub">${String(item.id).padStart(2, '0')}</div>
@@ -376,15 +427,7 @@ function renderQueue() {
     });
 }
 
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-// ---- History tab ----------------------------------------------------------
+// ---- History tab --------------------------------------------------------
 
 function switchTab(tab) {
   els.tabManifest.classList.toggle('is-active', tab === 'manifest');
@@ -401,7 +444,11 @@ els.tabHistory.addEventListener('click', () => switchTab('history'));
 function formatTimestamp(ts) {
   if (!ts) return '';
   const d = new Date(ts);
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' · ' + d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  return (
+    d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) +
+    ' · ' +
+    d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+  );
 }
 
 async function loadHistory() {

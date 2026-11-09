@@ -4,24 +4,51 @@ const os = require('os');
 const fs = require('fs');
 const fsPromises = fs.promises;
 const { spawn } = require('child_process');
+const https = require('https');
 
 let mainWindow;
 
-// Tracks in-flight yt-dlp child processes: id -> { proc, intent, destinations }
+// Tracks in-flight yt-dlp child processes: id -> { proc, intent, destinations, pollTimer }
 // intent is 'run' unless we're the ones killing it on purpose ('pause' or 'cancel'),
 // which tells the close handler how to interpret an exit that we triggered ourselves.
 // destinations collects every "[download] Destination: ..." path yt-dlp reports,
 // so a full cancel/discard can clean up partial files.
 const runningProcesses = new Map();
 
-// ---- Bundled / auto-fetched binaries ------------------------------------
-//
-// yt-dlp.exe ships inside the app itself (small, ~18MB) — see bin/win/.
-// ffmpeg is NOT bundled (a static build is ~100MB+); instead, on first run,
-// if it's not already on the system, we download it once into userData and
-// reuse it from then on.
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 980,
+    height: 720,
+    minWidth: 720,
+    minHeight: 520,
+    backgroundColor: '#12141a',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
 
-const https = require('https');
+  mainWindow.setMenuBarVisibility(false);
+  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  if (!app.isPackaged) {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  }
+}
+
+// ---- Bundled / auto-fetched binaries --------------------------------------
+//
+// yt-dlp ships inside the app (bin/win or bin/linux). On first run it's copied
+// into userData (always writable, regardless of where the app itself is
+// installed) and then self-updated in place via `yt-dlp -U` — so the bundled
+// copy you shipped keeps itself current against new YouTube changes without
+// needing a whole new app release each time yt-dlp cuts a new version.
+//
+// ffmpeg is NOT bundled (a static build is ~100MB+); on Windows, if it's not
+// already on the system, the app downloads a static build once into userData
+// and reuses it from then on. On Linux/macOS it's just expected on PATH
+// (a one-line install via the system package manager).
 
 function ytdlpBinaryName() {
   return process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
@@ -37,10 +64,68 @@ function bundledBinDir() {
   return path.join(base, platformDir);
 }
 
+function ytdlpCachePath() {
+  return path.join(app.getPath('userData'), 'yt-dlp-bin', ytdlpBinaryName());
+}
+
+let resolvedYtdlpPath = null;
+
 function getYtdlpPath() {
+  if (resolvedYtdlpPath && fs.existsSync(resolvedYtdlpPath)) return resolvedYtdlpPath;
+  const cached = ytdlpCachePath();
+  if (fs.existsSync(cached)) return cached;
   const bundled = path.join(bundledBinDir(), ytdlpBinaryName());
   if (fs.existsSync(bundled)) return bundled;
   return ytdlpBinaryName(); // fall back to system PATH
+}
+
+// Copies the bundled yt-dlp into userData (if not already there) so it has a
+// writable home, then runs `yt-dlp -U` against that copy to self-update.
+// Runs once per app launch, in the background — never blocks startup, since
+// getYtdlpPath() happily falls back to the bundled copy until this finishes.
+function ensureYtdlp(onStatus) {
+  const cached = ytdlpCachePath();
+
+  try {
+    if (!fs.existsSync(cached)) {
+      const bundled = path.join(bundledBinDir(), ytdlpBinaryName());
+      if (fs.existsSync(bundled)) {
+        fs.mkdirSync(path.dirname(cached), { recursive: true });
+        fs.copyFileSync(bundled, cached);
+        if (process.platform !== 'win32') fs.chmodSync(cached, 0o755);
+      }
+    }
+  } catch (err) {
+    onStatus && onStatus({ state: 'error', message: err.message });
+    return; // fall back to whatever getYtdlpPath() resolves on its own
+  }
+
+  if (!fs.existsSync(cached)) return; // no bundled binary for this platform either
+
+  resolvedYtdlpPath = cached;
+  onStatus && onStatus({ state: 'checking' });
+
+  const proc = spawn(cached, ['-U', '--no-warnings'], {
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+  });
+  let out = '';
+  proc.stdout.on('data', (c) => (out += c.toString()));
+  proc.stderr.on('data', (c) => (out += c.toString()));
+  proc.on('error', () => {
+    onStatus && onStatus({ state: 'error', message: 'Could not run yt-dlp self-update.' });
+  });
+  proc.on('close', () => {
+    const text = out.trim();
+    if (/up.to.date/i.test(text)) {
+      onStatus && onStatus({ state: 'up-to-date' });
+    } else if (/updat(ed|ing)/i.test(text)) {
+      const versionMatch = text.match(/to\s+([\d.]+)/i);
+      onStatus && onStatus({ state: 'updated', version: versionMatch ? versionMatch[1] : null });
+    } else {
+      onStatus && onStatus({ state: 'checked' });
+    }
+    console.log('[fetch] yt-dlp self-update result:', text || '(no output)');
+  });
 }
 
 function resolveOnPath(cmd) {
@@ -128,84 +213,7 @@ function findFileRecursive(dir, filename) {
   return null;
 }
 
-// ---- Settings (cookies-from-browser choice, subtitle default) -----------
-// Small JSON file in userData — no need for a real database for two fields.
-
-function settingsPath() {
-  return path.join(app.getPath('userData'), 'settings.json');
-}
-
-function loadSettings() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
-    return raw && typeof raw === 'object' ? raw : {};
-  } catch (_e) {
-    return {};
-  }
-}
-
-function saveSettings(partial) {
-  const merged = { ...loadSettings(), ...partial };
-  try {
-    fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
-    fs.writeFileSync(settingsPath(), JSON.stringify(merged, null, 2));
-  } catch (_e) {
-    // Non-fatal — worst case, the setting doesn't persist across restarts.
-  }
-  return merged;
-}
-
-// ---- History (persists across restarts, separate from the live queue) ---
-
-function historyPath() {
-  return path.join(app.getPath('userData'), 'history.json');
-}
-
-function loadHistory() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(historyPath(), 'utf8'));
-    return Array.isArray(raw) ? raw : [];
-  } catch (_e) {
-    return [];
-  }
-}
-
-function saveHistory(list) {
-  try {
-    fs.mkdirSync(path.dirname(historyPath()), { recursive: true });
-    fs.writeFileSync(historyPath(), JSON.stringify(list, null, 2));
-  } catch (_e) {
-    // Non-fatal — worst case, this run's history entry doesn't persist.
-  }
-}
-
-function addHistoryEntry(entry) {
-  const list = loadHistory();
-  list.unshift(entry); // newest first
-  if (list.length > 500) list.length = 500; // keep the file from growing forever
-  saveHistory(list);
-}
-
-// ---- Cookies-from-browser / subtitles arg builders -----------------------
-
-function buildCookieArgs(settings) {
-  if (settings && settings.cookiesBrowser && settings.cookiesBrowser !== 'none') {
-    return ['--cookies-from-browser', settings.cookiesBrowser];
-  }
-  return [];
-}
-
-function buildSubtitleArgs(wantSubtitles) {
-  if (!wantSubtitles) return [];
-  const args = ['--write-subs', '--write-auto-subs', '--sub-langs', 'en.*,en'];
-  // Conversion to .srt needs ffmpeg; if we don't have one resolved yet, subs still
-  // download fine, just in whatever format the site serves (usually .vtt).
-  if (resolvedFfmpegPath) args.push('--convert-subs', 'srt');
-  return args;
-}
-
 // Resolves a usable ffmpeg path: cached copy > system PATH > one-time download.
-// onProgress receives { state: 'checking' | 'downloading' | 'extracting' | 'ready', percent? }
 async function ensureFfmpeg(onProgress) {
   const cachedExe = path.join(ffmpegCacheDir(), ffmpegBinaryName());
   if (fs.existsSync(cachedExe)) {
@@ -223,8 +231,6 @@ async function ensureFfmpeg(onProgress) {
   }
 
   if (process.platform !== 'win32') {
-    // Auto-download is only wired up for Windows; other platforms should
-    // install ffmpeg themselves (brew/apt), matching the README.
     onProgress && onProgress({ state: 'error', message: 'ffmpeg not found on PATH.' });
     return null;
   }
@@ -273,90 +279,81 @@ async function ensureFfmpeg(onProgress) {
 
 let resolvedFfmpegPath = null;
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 980,
-    height: 720,
-    minWidth: 720,
-    minHeight: 520,
-    backgroundColor: '#12141a',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
+// ---- Settings (cookies-from-browser choice, subtitle default) -------------
 
-  mainWindow.setMenuBarVisibility(false);
-  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+function settingsPath() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
 
-  if (!app.isPackaged) {
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
+function loadSettings() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch (_e) {
+    return {};
   }
 }
 
-app.whenReady().then(createWindow);
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
-
-app.on('before-quit', () => {
-  // Don't leave orphaned yt-dlp processes running (and eating disk space)
-  // after the app window is closed.
-  for (const [, entry] of runningProcesses) {
-    try {
-      if (entry.pollTimer) clearInterval(entry.pollTimer);
-      entry.proc.kill();
-    } catch (_e) {
-      // already dead, ignore
-    }
+function saveSettings(partial) {
+  const merged = { ...loadSettings(), ...partial };
+  try {
+    fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
+    fs.writeFileSync(settingsPath(), JSON.stringify(merged, null, 2));
+  } catch (_e) {
+    // Non-fatal — worst case, the setting doesn't persist across restarts.
   }
-  // Also sweep any leftover temp fragments (e.g. from downloads that were left
-  // paused when the app closed) so they don't sit around taking up space forever.
-  fs.rm(TEMP_ROOT, { recursive: true, force: true }, () => {});
-});
-
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
-});
-
-// ---- Helpers -------------------------------------------------------------
-
-function runYtDlpJSON(args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(getYtdlpPath(), args, {
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
-    });
-    let stdout = '';
-    let stderr = '';
-
-    proc.stdout.on('data', (chunk) => (stdout += chunk.toString()));
-    proc.stderr.on('data', (chunk) => (stderr += chunk.toString()));
-
-    proc.on('error', (err) => {
-      if (err.code === 'ENOENT') {
-        reject(new Error('YTDLP_NOT_FOUND'));
-      } else {
-        reject(err);
-      }
-    });
-
-    proc.on('close', (code) => {
-      if (code !== 0 && !stdout.trim()) {
-        reject(new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
-        return;
-      }
-      resolve(stdout);
-    });
-  });
+  return merged;
 }
 
-// Each download gets its own scratch folder for in-progress fragments — this both
-// prevents two downloads of the same title (e.g. different qualities) from ever
-// colliding on temp files, AND gives us an isolated folder we can poll for real-time
-// progress (see below), independent of yt-dlp's own — currently unreliable when piped
-// — progress text.
+// ---- History (persists across restarts, separate from the live queue) -----
+
+function historyPath() {
+  return path.join(app.getPath('userData'), 'history.json');
+}
+
+function loadHistory() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(historyPath(), 'utf8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch (_e) {
+    return [];
+  }
+}
+
+function saveHistory(list) {
+  try {
+    fs.mkdirSync(path.dirname(historyPath()), { recursive: true });
+    fs.writeFileSync(historyPath(), JSON.stringify(list, null, 2));
+  } catch (_e) {
+    // Non-fatal.
+  }
+}
+
+function addHistoryEntry(entry) {
+  const list = loadHistory();
+  list.unshift(entry);
+  if (list.length > 500) list.length = 500;
+  saveHistory(list);
+}
+
+// ---- Cookies-from-browser / subtitles arg builders -------------------------
+
+function buildCookieArgs(settings) {
+  if (settings && settings.cookiesBrowser && settings.cookiesBrowser !== 'none') {
+    return ['--cookies-from-browser', settings.cookiesBrowser];
+  }
+  return [];
+}
+
+function buildSubtitleArgs(wantSubtitles) {
+  if (!wantSubtitles) return [];
+  const args = ['--write-subs', '--write-auto-subs', '--sub-langs', 'en.*,en'];
+  if (resolvedFfmpegPath) args.push('--convert-subs', 'srt');
+  return args;
+}
+
+// ---- Per-download temp isolation (also drives disk-polled progress) -------
+
 const TEMP_ROOT = path.join(os.tmpdir(), 'fetch-video-dl');
 
 function tempDirFor(id) {
@@ -411,9 +408,72 @@ function buildFormatArgs(formatChoice) {
   }
 }
 
-// Best-effort: ask yt-dlp for the expected total size of the format we're about to
-// download, so disk-polling progress can show a real percentage. Failure is fine —
-// we just fall back to showing bytes-downloaded without a fixed target.
+function runYtDlpJSON(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(getYtdlpPath(), args, {
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    });
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (chunk) => (stdout += chunk.toString()));
+    proc.stderr.on('data', (chunk) => (stderr += chunk.toString()));
+
+    proc.on('error', (err) => {
+      if (err.code === 'ENOENT') {
+        reject(new Error('YTDLP_NOT_FOUND'));
+      } else {
+        reject(err);
+      }
+    });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || stdout.trim() || `yt-dlp exited with code ${code}`));
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+function friendlyYtdlpError(rawMessage) {
+  const msg = (rawMessage || '').toString();
+  const errorLine = msg
+    .split('\n')
+    .map((l) => l.trim())
+    .reverse()
+    .find((l) => /^ERROR:/i.test(l));
+  const core = (errorLine || msg).replace(/^ERROR:\s*/i, '').trim();
+
+  if (/sign in to confirm your age|age.?restrict/i.test(core)) {
+    return 'This video is age-restricted and needs a signed-in account to view — not something this app can get past.';
+  }
+  if (/sign in to confirm (you.?re not a bot|you are not a bot)/i.test(core)) {
+    return "YouTube is asking to confirm you're not a bot — this happens on and off across yt-dlp and usually needs either an updated yt-dlp or your browser's cookies. Try the Cookies dropdown (pick your browser, fully closed first), or try again shortly.";
+  }
+  if (/private video/i.test(core)) {
+    return "This video is private — you'd need access on the original site to download it.";
+  }
+  if (/video (unavailable|has been removed)/i.test(core) || /this video is not available/i.test(core)) {
+    return 'This video is unavailable or has been removed from the site.';
+  }
+  if (/not available in your country|geo.?restrict/i.test(core)) {
+    return "This video isn't available in your region.";
+  }
+  if (/unsupported url|no extractor/i.test(core)) {
+    return "This site isn't supported. yt-dlp only works with sites it has explicit support for (YouTube, Vimeo, Twitch, and hundreds of others) — this one isn't on that list.";
+  }
+  if (/http error 403/i.test(core)) {
+    return 'The site refused the request (403). This can happen when yt-dlp needs an update — try again in a bit.';
+  }
+  if (/unable to download webpage|network is unreachable|getaddrinfo/i.test(core)) {
+    return 'Could not reach that site — check your internet connection and the URL.';
+  }
+
+  return core || 'Could not read that URL.';
+}
+
 async function probeExpectedBytes(url, formatArgs, cookieArgs) {
   try {
     const stdout = await runYtDlpJSON([
@@ -440,7 +500,68 @@ async function probeExpectedBytes(url, formatArgs, cookieArgs) {
   }
 }
 
-// ---- IPC handlers -------------------------------------------------------
+// ---- App lifecycle ----------------------------------------------------------
+
+app.whenReady().then(() => {
+  createWindow();
+  setupAutoUpdater();
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+});
+
+app.on('before-quit', () => {
+  for (const [, entry] of runningProcesses) {
+    try {
+      if (entry.pollTimer) clearInterval(entry.pollTimer);
+      entry.proc.kill();
+    } catch (_e) {
+      // already dead, ignore
+    }
+  }
+  fs.rm(TEMP_ROOT, { recursive: true, force: true }, () => {});
+});
+
+// ---- Auto-update (app itself, via electron-updater + GitHub Releases) -----
+
+function setupAutoUpdater() {
+  if (!app.isPackaged) return; // nothing published to check against in dev
+
+  let autoUpdater;
+  try {
+    autoUpdater = require('electron-updater').autoUpdater;
+  } catch (_e) {
+    return; // electron-updater not installed yet — fine, just skip
+  }
+
+  const send = (status) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-status', status);
+    }
+  };
+
+  autoUpdater.autoDownload = true;
+
+  autoUpdater.on('checking-for-update', () => send({ state: 'checking' }));
+  autoUpdater.on('update-available', (info) => send({ state: 'downloading', version: info.version }));
+  autoUpdater.on('update-not-available', () => send({ state: 'up-to-date' }));
+  autoUpdater.on('download-progress', (p) => send({ state: 'downloading', percent: Math.round(p.percent) }));
+  autoUpdater.on('update-downloaded', (info) => send({ state: 'ready', version: info.version }));
+  autoUpdater.on('error', (err) => send({ state: 'error', message: err.message }));
+
+  autoUpdater.checkForUpdates();
+
+  ipcMain.handle('install-update', async () => {
+    autoUpdater.quitAndInstall();
+  });
+}
+
+// ---- IPC handlers -----------------------------------------------------------
 
 ipcMain.handle('choose-folder', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
@@ -458,8 +579,6 @@ ipcMain.handle('open-folder', async (_event, folderPath) => {
   shell.openPath(folderPath);
 });
 
-// Kicks off ffmpeg resolution (cached > system > one-time download), streaming
-// progress to the renderer over 'ffmpeg-status'.
 ipcMain.handle('ensure-ffmpeg', async () => {
   const result = await ensureFfmpeg((status) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -467,6 +586,15 @@ ipcMain.handle('ensure-ffmpeg', async () => {
     }
   });
   resolvedFfmpegPath = result;
+
+  // Kick off yt-dlp's own self-update now too — after ffmpeg is sorted, since
+  // both can download over the network and there's no need to race them.
+  ensureYtdlp((status) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('ytdlp-status', status);
+    }
+  });
+
   return { ok: !!result, path: result };
 });
 
@@ -486,43 +614,6 @@ ipcMain.handle('clear-history', async () => {
   return true;
 });
 
-// Resolve a pasted URL into one or more downloadable items (expands playlists)
-function friendlyYtdlpError(rawMessage) {
-  const msg = (rawMessage || '').toString();
-  // yt-dlp errors are usually one or more "ERROR: ..." lines, sometimes with a
-  // traceback under them; pull out just the actual error text.
-  const errorLine = msg
-    .split('\n')
-    .map((l) => l.trim())
-    .reverse()
-    .find((l) => /^ERROR:/i.test(l));
-  const core = (errorLine || msg).replace(/^ERROR:\s*/i, '').trim();
-
-  if (/sign in to confirm your age|age.?restrict/i.test(core)) {
-    return 'This video is age-restricted and needs a signed-in account to view — not something this app can get past.';
-  }
-  if (/private video/i.test(core)) {
-    return "This video is private — you'd need access on the original site to download it.";
-  }
-  if (/video (unavailable|has been removed)/i.test(core)) {
-    return 'This video is unavailable or has been removed from the site.';
-  }
-  if (/not available in your country|geo.?restrict/i.test(core)) {
-    return "This video isn't available in your region.";
-  }
-  if (/unsupported url|no extractor/i.test(core)) {
-    return "This site isn't supported. yt-dlp only works with sites it has explicit support for (YouTube, Vimeo, Twitch, and hundreds of others) — this one isn't on that list.";
-  }
-  if (/http error 403/i.test(core)) {
-    return 'The site refused the request (403). This can happen when yt-dlp needs an update — try again in a bit.';
-  }
-  if (/unable to download webpage|network is unreachable|getaddrinfo/i.test(core)) {
-    return 'Could not reach that site — check your internet connection and the URL.';
-  }
-
-  return core || 'Could not read that URL.';
-}
-
 ipcMain.handle('resolve-url', async (_event, url) => {
   try {
     const settings = loadSettings();
@@ -535,6 +626,9 @@ ipcMain.handle('resolve-url', async (_event, url) => {
       url,
     ]);
     const info = JSON.parse(stdout);
+    if (!info || typeof info !== 'object') {
+      throw new Error("yt-dlp didn't return usable info for this video.");
+    }
 
     const bestThumb = (thumbnails, fallback) => {
       if (fallback) return fallback;
@@ -609,7 +703,6 @@ ipcMain.handle('start-download', async (event, { id, url, folder, format, title,
     const cookieArgs = buildCookieArgs(settings);
     const subtitleArgs = buildSubtitleArgs(subtitles);
 
-    // Best-effort — doesn't block the actual download if it's slow or fails.
     const expectedBytesPromise = probeExpectedBytes(url, formatArgs, cookieArgs);
 
     const args = [
@@ -622,12 +715,6 @@ ipcMain.handle('start-download', async (event, { id, url, folder, format, title,
       '--ignore-config',
       '--print',
       'after_move:FILEPATH %(filepath)s',
-      // Fragments/partial files land in a per-job temp dir, both so concurrent
-      // downloads of the same title never collide, and so we can reliably poll
-      // "how many bytes has this specific job written" on disk ourselves —
-      // yt-dlp's own --progress-template output isn't delivered in real time when
-      // piped (a confirmed upstream limitation, not something we can flag our way
-      // out of), so we don't rely on it for the live percentage anymore.
       '-P',
       `temp:${tempDir}`,
       '-P',
@@ -657,7 +744,6 @@ ipcMain.handle('start-download', async (event, { id, url, folder, format, title,
       expectedBytes = bytes;
     });
 
-    // --- Real-time progress via disk polling -----------------------------
     let lastPollBytes = 0;
     let lastPollTime = Date.now();
 
@@ -774,8 +860,6 @@ ipcMain.handle('start-download', async (event, { id, url, folder, format, title,
         addHistoryEntry(histEntry);
         send({ status: 'done', percent: 100, filepath: finalFilePath });
       } else {
-        // Prefer the last actual "ERROR: ..." line yt-dlp printed over just the
-        // last line of stderr, which is often a generic retry/warning notice.
         const lines = stderrTail.trim().split('\n').filter(Boolean);
         const errorLine = [...lines].reverse().find((l) => /^ERROR:/i.test(l.trim()));
         send({
@@ -793,12 +877,12 @@ ipcMain.handle('start-download', async (event, { id, url, folder, format, title,
   }
 });
 
-// Pause: kill the process but keep any partial files, so Resume (a plain
-// start-download with the same id/url/folder/format) can pick up where it left off.
+// Pause: kill the process but deliberately keep its temp fragments on disk.
 ipcMain.handle('pause-download', async (_event, id) => {
   const entry = runningProcesses.get(id);
   if (!entry) return false;
   entry.intent = 'pause';
+  if (entry.pollTimer) clearInterval(entry.pollTimer);
   entry.proc.kill();
   return true;
 });
@@ -816,8 +900,6 @@ ipcMain.handle('cancel-download', async (_event, id, knownDestinations) => {
     if (entry.pollTimer) clearInterval(entry.pollTimer);
     entry.proc.kill();
   } else {
-    // Already exited (e.g. was paused) — nothing left to kill, but its temp
-    // fragments are still on disk, so clean those up ourselves.
     cleanupTempDir(id);
   }
 
@@ -840,7 +922,7 @@ ipcMain.handle('delete-file', async (_event, filepath) => {
     await fsPromises.unlink(filepath);
     return true;
   } catch (err) {
-    if (err.code === 'ENOENT') return true; // already gone, treat as success
+    if (err.code === 'ENOENT') return true;
     throw err;
   }
 });
