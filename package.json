@@ -1,6 +1,6 @@
 {
   "name": "video-download-manager",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A desktop download manager for videos and playlists, powered by yt-dlp",
   "main": "main.js",
   "scripts": {
@@ -51,7 +51,10 @@
       "include": "build/installer.nsh"
     },
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "icon": "build/icon.png",
       "category": "Network",
       "executableName": "fetch",
